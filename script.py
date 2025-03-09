@@ -2,20 +2,11 @@ import os
 from dotenv import load_dotenv
 import librosa
 import numpy as np
-from moviepy.editor import AudioFileClip, ImageClip, CompositeVideoClip, TextClip, ColorClip, vfx
-from moviepy.video.fx.resize import resize
-from moviepy.video.fx.blackwhite import blackwhite
-import PIL
-from PIL import Image
+from moviepy.editor import AudioFileClip, ImageClip, ColorClip, CompositeVideoClip, TextClip, VideoClip
+from PIL import Image, ImageDraw, ImageEnhance
 import moviepy.config as mpconf
-import math
-import random
 
-# Add ANTIALIAS if it doesn't exist (for Pillow 9.0.0+)
-if not hasattr(Image, 'ANTIALIAS'):
-    Image.ANTIALIAS = Image.LANCZOS  # LANCZOS is the replacement for ANTIALIAS
-
-# Set ImageMagick path for MoviePy (installed via Homebrew on macOS)
+# Set ImageMagick path (adjust this if your setup's different)
 mpconf.change_settings({"IMAGEMAGICK_BINARY": "/opt/homebrew/bin/convert"})
 
 # Load environment variables
@@ -24,221 +15,192 @@ TRACK_PATH = os.getenv("TRACK_PATH", "do_the_loftwah.mp3")
 IMAGE_PATH = os.getenv("IMAGE_PATH", "cover.jpg")
 TITLE = os.getenv("TITLE", "Do the Loftwah")
 OUTPUT_PATH = os.getenv("OUTPUT_PATH", "do_the_loftwah.mp4")
-BG_COLOR = os.getenv("BG_COLOR", "#000000")  # Default to black background
 
 print(f"Creating video from {TRACK_PATH} and {IMAGE_PATH}")
-
-# Video settings
-WIDTH, HEIGHT = 1920, 1080
-FPS = 24
 
 # Load audio
 audio = AudioFileClip(TRACK_PATH)
 duration = audio.duration
+y, sr = librosa.load(TRACK_PATH)
 print(f"Audio duration: {duration:.2f} seconds")
 
-# Analyze audio for beats and amplitude
-y, sr = librosa.load(TRACK_PATH)
+# Analyze audio for beats and tempo
 tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
 beat_times = librosa.frames_to_time(beats, sr=sr)
 print(f"Detected tempo: {float(tempo):.2f} BPM with {len(beat_times)} beats")
 
-# Calculate amplitude for visualization effects
+# Compute RMS for brightness adjustment
+frame_length = 2048
 hop_length = 512
-amplitude = np.abs(librosa.stft(y, hop_length=hop_length))
-amplitude_db = librosa.amplitude_to_db(amplitude, ref=np.max)
-amplitude_norm = (amplitude_db - amplitude_db.min()) / (amplitude_db.max() - amplitude_db.min())
+rms = librosa.feature.rms(y=y, frame_length=frame_length, hop_length=hop_length)[0]
+rms_times = librosa.times_like(rms, sr=sr, hop_length=hop_length)
+min_rms = np.min(rms)
+max_rms = np.max(rms)
 
-# Create a function to get amplitude at a specific time
-def get_amplitude_at_time(t):
-    frame_idx = int(t * sr / hop_length)
-    if frame_idx >= amplitude_norm.shape[1]:
-        frame_idx = amplitude_norm.shape[1] - 1
-    # Take mean across frequency bins for overall energy
-    return np.mean(amplitude_norm[:, frame_idx])
+# Video dimensions
+w_video, h_video = 1920, 1080
 
-# Create background
-background = ColorClip((WIDTH, HEIGHT), color=BG_COLOR).set_duration(duration)
+# Black background
+background = ColorClip(size=(w_video, h_video), color=(0, 0, 0)).set_duration(duration)
 
-# Load image and apply initial effects
-img = ImageClip(IMAGE_PATH)
-# Make sure image maintains aspect ratio but fits nicely in frame
-img_w, img_h = img.size
-target_size = min(WIDTH * 0.6, HEIGHT * 0.6)  # Take up 60% of the smaller dimension
-scale = min(target_size / img_w, target_size / img_h)
-img = img.resize(width=img_w * scale)
+# Load image
+image_clip = ImageClip(IMAGE_PATH).set_duration(duration)
 
-# Create more dynamic visual effects that respond to the music
-def dynamic_zoom_and_pulse(t):
-    # Base size modulation on beat proximity and amplitude
-    amp = get_amplitude_at_time(t) * 0.5  # Scale amplitude effect
+# Panning effect (left to right)
+def pan_func(t):
+    start_x = -image_clip.w // 4
+    end_x = w_video - image_clip.w * 3 // 4
+    x = start_x + (end_x - start_x) * (t / duration)
+    return (x, 'center')
+
+image_clip = image_clip.set_position(pan_func)
+
+# Patch the resizer function in moviepy to fix ANTIALIAS issue
+def patched_resizer(image, newsize):
+    pilim = Image.fromarray(image)
     
-    # Check if on or near beat
-    on_beat = False
-    beat_intensity = 0
-    for bt in beat_times:
-        beat_distance = abs(t - bt)
-        if beat_distance < 0.1:  # Within 100ms of a beat
-            on_beat = True
-            beat_intensity = max(beat_intensity, 1 - (beat_distance * 10))  # Higher for closer beats
+    # Handle if newsize contains floats instead of integers
+    if isinstance(newsize, tuple) and len(newsize) == 2:
+        # When newsize is a tuple of scaling factors
+        h, w = image.shape[:2]
+        if isinstance(newsize[0], (float, np.float64)):
+            new_w = int(w * newsize[0])
+            new_h = int(h * newsize[1])
+            newsize = (new_w, new_h)
     
-    # Base zoom that gradually varies with time for subtle movement
-    base_zoom = 1.0 + 0.05 * math.sin(t * 0.5)
+    # Ensure newsize contains integers
+    newsize = tuple(int(round(x)) for x in newsize)
     
-    # Add pulse on beats
-    if on_beat:
-        # Stronger effect on the beat
-        zoom = base_zoom + (0.2 * beat_intensity)
+    # Use LANCZOS instead of ANTIALIAS (which is deprecated in newer PIL versions)
+    resample_method = getattr(Image, "LANCZOS", getattr(Image.Resampling, "LANCZOS", Image.BICUBIC))
+    
+    # Reverse width and height for PIL's resize (it expects width, height)
+    resized_pil = pilim.resize(newsize[::-1], resample_method)
+    return np.array(resized_pil)
+
+# Monkey patch the resizer function in moviepy
+from moviepy.video.fx.resize import resizer
+import moviepy.video.fx.resize
+moviepy.video.fx.resize.resizer = patched_resizer
+
+# Zoom on beats
+def zoom_func(t):
+    if len(beat_times) == 0:
+        return 1
+    idx = np.searchsorted(beat_times, t, side='right') - 1
+    if idx >= 0:
+        bt = beat_times[idx]
+        time_since_beat = t - bt
+        if time_since_beat < 0.5:  # 0.5s window
+            return 1 + 0.1 * np.exp(-time_since_beat / 0.2)  # Max zoom 1.1, decays fast
+    return 1
+
+# Convert the zoom factor to a proper resize tuple
+def apply_zoom(t):
+    zoom = zoom_func(t)
+    # Return a tuple of (width, height) representing the scale factor
+    return (zoom, zoom)
+
+image_clip = image_clip.resize(apply_zoom)
+
+# Brightness adjustment based on RMS
+def adjust_brightness(image, t):
+    rms_value = np.interp(t, rms_times, rms)
+    factor = 0.5 + (rms_value - min_rms) / (max_rms - min_rms) * 1.0  # 0.5 to 1.5 brightness
+    enhancer = ImageEnhance.Brightness(Image.fromarray(image))
+    return np.array(enhancer.enhance(factor))
+
+image_clip = image_clip.fl(lambda gf, t: adjust_brightness(gf(t), t))
+
+# Waveform visualization
+def make_waveform_frame(t):
+    window_duration = 1  # Last 1 second
+    start_sample = max(0, int((t - window_duration) * sr))
+    end_sample = int(t * sr)
+    segment = y[start_sample:end_sample] if start_sample < end_sample else np.zeros(1)
+    
+    # Safe normalization to avoid NaN values
+    max_abs = np.max(np.abs(segment))
+    if max_abs > 0:  # Check if the segment contains any non-zero values
+        segment = segment / max_abs  # Normalize
     else:
-        # Subtle amplitude-based effect between beats
-        zoom = base_zoom + (0.1 * amp)
+        segment = np.zeros(len(segment) if len(segment) > 0 else 1)
+        
+    waveform_width = 500
+    waveform_height = 100
+    img = Image.new('RGB', (waveform_width, waveform_height), color='black')
+    draw = ImageDraw.Draw(img)
+    color_factor = (np.interp(t, rms_times, rms) - min_rms) / (max_rms - min_rms)
+    color = (int(255 * color_factor), 0, int(255 * (1 - color_factor)))  # Blue to red
     
-    return zoom
+    # Safety check for segment length
+    if len(segment) <= 1:
+        # Just draw a flat line in the middle if there's no valid audio segment
+        draw.line([(0, waveform_height//2), (waveform_width, waveform_height//2)], fill=color, width=1)
+    else:
+        for i in range(waveform_width - 1):
+            x0 = i
+            idx1 = min(int(i / waveform_width * len(segment)), len(segment) - 1)
+            idx2 = min(int((i + 1) / waveform_width * len(segment)), len(segment) - 1)
+            
+            # Ensure we don't get NaN values or index out of bounds
+            y_val1 = segment[idx1] if not np.isnan(segment[idx1]) else 0
+            y_val2 = segment[idx2] if not np.isnan(segment[idx2]) else 0
+            
+            y0 = int(waveform_height / 2 + (y_val1 * waveform_height / 2))
+            x1 = i + 1
+            y1 = int(waveform_height / 2 + (y_val2 * waveform_height / 2))
+            
+            draw.line([(x0, y0), (x1, y1)], fill=color, width=1)
+            
+    return np.array(img)
 
-# Apply the dynamic effect
-img_fx = img.fx(
-    resize, 
-    lambda t: dynamic_zoom_and_pulse(t)
-)
+waveform_clip = VideoClip(make_frame=make_waveform_frame, duration=duration).set_position((100, h_video - 150))
 
-# Add a subtle rotation effect based on beats
-def rotate_on_beat(gf, t):
-    img = gf(t)
-    
-    # Check if near a beat
-    for bt in beat_times:
-        beat_distance = abs(t - bt)
-        if beat_distance < 0.1:
-            # Apply subtle rotation on beats, more pronounced closer to the beat
-            intensity = 1 - (beat_distance * 10)
-            angle = 2 * intensity * math.sin(t * 4)  # Small oscillating rotation
-            return vfx.rotate(img, angle)
-    
-    return img
+# Flash effect on beats
+def make_flash_mask(t):
+    if len(beat_times) == 0:
+        return 0
+    idx = np.searchsorted(beat_times, t, side='right') - 1
+    if idx >= 0:
+        bt = beat_times[idx]
+        time_since_beat = t - bt
+        if time_since_beat < 0.1:  # 0.1s flash
+            return 0.5 * np.exp(-time_since_beat / 0.05)  # Peak opacity 0.5
+    return 0
 
-# Apply rotation effect
-img_fx = img_fx.fl(rotate_on_beat)
+# Create a VideoClip for opacity mask
+flash_mask = VideoClip(lambda t: np.ones((h_video, w_video)) * make_flash_mask(t), 
+                      duration=duration, ismask=True)
+flash_clip = ColorClip(size=(w_video, h_video), color=(255, 255, 255)).set_duration(duration)
+flash_clip = flash_clip.set_mask(flash_mask)
 
-# Add a pulsing glow/shadow effect
-def add_glow_effect(gf, t):
-    # Create glow based on music amplitude
-    amp = get_amplitude_at_time(t)
-    
-    # Base image
-    img = gf(t)
-    
-    # Only apply glow on strong beats or high amplitude
-    on_strong_beat = False
-    for bt in beat_times:
-        if abs(t - bt) < 0.05:  # Even tighter timing for glow effect
-            on_strong_beat = True
-            break
-    
-    if on_strong_beat or amp > 0.7:  # Only on strong beats or high amplitude
-        # Amount of blur/glow depends on amplitude
-        glow_amount = max(0.5, amp) * 5
-        glow = vfx.gaussian_blur(img, glow_amount)
-        return vfx.add_plugin(img, glow, amp)
-    
-    return img
+# Progress bar
+def make_progress_frame(t):
+    img = Image.new('RGB', (w_video, 20), color='black')
+    draw = ImageDraw.Draw(img)
+    progress_width = int(w_video * t / duration)
+    draw.rectangle([0, 0, progress_width, 20], fill='white')
+    return np.array(img)
 
-# Apply the glow effect (wrapped in try-except in case the effect isn't available)
+progress_clip = VideoClip(make_frame=make_progress_frame, duration=duration).set_position(('center', h_video - 20))
+
+# Title overlay
 try:
-    img_fx = img_fx.fl(add_glow_effect)
-except:
-    print("Warning: Could not apply glow effect. Continuing without it.")
+    # Try with the specified font first
+    title_clip = TextClip(TITLE, fontsize=48, color='white', font='Arial-Bold').set_duration(duration).set_position(('center', 'top'))
+except Exception as e:
+    print(f"Warning: Could not create text clip with specified font. Using default. Error: {e}")
+    # Fall back to default font if Arial-Bold isn't available
+    title_clip = TextClip(TITLE, fontsize=48, color='white').set_duration(duration).set_position(('center', 'top'))
 
-# Create primary title text with better styling
-title_font = 'Arial-Bold' if os.path.exists('/Library/Fonts/Arial Bold.ttf') else 'Arial'
-main_text = TextClip(
-    TITLE,
-    fontsize=100,
-    color='white',
-    font=title_font,
-    stroke_color='black',
-    stroke_width=3,
-    method='label'
-)
-
-# Add text animation
-def animate_text(t):
-    # Get current amplitude
-    amp = get_amplitude_at_time(t)
-    
-    # Base scale varies slightly with time for continuous movement
-    scale = 1.0 + 0.02 * math.sin(t * 2)
-    
-    # Enhanced scale on beats
-    for bt in beat_times:
-        if abs(t - bt) < 0.1:
-            intensity = 1 - (abs(t - bt) * 10)
-            scale += 0.1 * intensity
-    
-    # Add amplitude influence
-    scale += 0.05 * amp
-    
-    return scale
-
-# Apply text animation
-main_text = main_text.fx(
-    resize,
-    lambda t: animate_text(t)
-)
-
-# Position at the bottom center with proper margin
-main_text = main_text.set_position(('center', HEIGHT - 150)).set_duration(duration)
-
-# Add subtitle text (tempo and beat info)
-info_text = f"{float(tempo):.1f} BPM"
-sub_text = TextClip(
-    info_text,
-    fontsize=40,
-    color='white',
-    font='Arial',
-    method='label'
-)
-sub_text = sub_text.set_position(('center', HEIGHT - 80)).set_duration(duration)
-
-# Create a pulsing circle visualization in the background
-def make_beat_circle(t):
-    # Create a circle that pulses with the beats
-    circle_size = (WIDTH, HEIGHT)
-    circle = ColorClip(circle_size, col=(0, 0, 0, 0))  # Transparent background
-    
-    # Draw circles on/near beats
-    for bt in beat_times:
-        time_diff = t - bt
-        # Only show expanding circles for 1 second after each beat
-        if 0 <= time_diff < 1:
-            # Circle expands outward from the beat
-            radius = int(time_diff * 500)  # Expands to 500px in 1 second
-            opacity = max(0, 1 - time_diff)  # Fade out over 1 second
-            
-            # Draw circle (this is just a placeholder since we can't actually draw here)
-            # In a real implementation, you'd need to use PIL to draw on the circle
-            
-    return circle
-
-# Combine all elements with proper layering
-video = CompositeVideoClip([
-    background,
-    img_fx.set_position('center'),
-    main_text,
-    sub_text
-], size=(WIDTH, HEIGHT))
-
-# Add subtle zoom in/out effect to the entire composition
-def subtle_zoom(t):
-    # Very subtle zoom effect that varies with time
-    return 1 + 0.01 * math.sin(t * 0.7)
-
-# Apply a very subtle zoom to the whole composition
-video = video.fx(resize, lambda t: subtle_zoom(t))
+# Smash it all together
+video = CompositeVideoClip([background, image_clip, waveform_clip, flash_clip, progress_clip, title_clip])
 
 # Add audio
-final_video = video.set_audio(audio)
+video = video.set_audio(audio)
 
-# Write video file
+# Write the fucking video
 print(f"Writing video to {OUTPUT_PATH}...")
-final_video.write_videofile(OUTPUT_PATH, fps=FPS, codec='libx264', audio_codec='aac')
-print("Done!")
+video.write_videofile(OUTPUT_PATH, fps=24, codec='libx264', audio_codec='aac')
+print("Done, motherfucker!")
