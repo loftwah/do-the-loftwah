@@ -104,15 +104,9 @@ image_clip = image_clip.resize(height=h_video * 1.1)  # Make it slightly larger 
 
 # Subtle position shift based on audio energy for background
 def bg_position(t):
-    # Subtle breathing effect for scale handled by video size
-    
     # Get audio energy
     rms_value = np.interp(t, rms_times, rms)
     energy_factor = (rms_value - min_rms) / (max_rms - min_rms) * 0.5  # Scale to 0-0.5%
-    
-    # Calculate absolute position (subtle movement)
-    x_shift = w_video * 0.01 * np.sin(t * 0.2) * energy_factor
-    y_shift = h_video * 0.01 * np.cos(t * 0.15) * energy_factor
     
     # Return position as (x, y) tuple with the image centered and slight shift
     return ('center', 'center')
@@ -120,9 +114,12 @@ def bg_position(t):
 # Set position with subtle movement
 image_clip = image_clip.set_position(bg_position)
 
+# Make background more visible
+image_clip = image_clip.set_opacity(0.8)  # 80% opacity for better visibility
+
 # Title effects with enhanced waveform response
 def create_title_clip():
-    # Create the base title clip with larger font size
+    # Create the base title clip with larger font size - WHITE TEXT
     try:
         base_title = TextClip(TITLE, fontsize=90, color='white', font='Arial-Bold', kerning=5)
     except Exception as e:
@@ -135,15 +132,11 @@ def create_title_clip():
     # Position in center
     base_title = base_title.set_position('center')
     
-    # Apply color and glow effects to the title based on audio
+    # Apply glow effects to the title based on audio
     def title_transform(image, t):
         # Get current audio features
         rms_value = np.interp(t, rms_times, rms)
         energy_factor = (rms_value - min_rms) / (max_rms - min_rms)
-        
-        # Get spectral information (brightness/tone of the sound)
-        spectral_value = np.interp(t, spectral_times, spectral_centroid)
-        spectral_factor = (spectral_value - np.min(spectral_centroid)) / (np.max(spectral_centroid) - np.min(spectral_centroid))
         
         # Check if we're on a beat
         on_beat = False
@@ -159,13 +152,8 @@ def create_title_clip():
         # Convert to PIL image for processing
         img = Image.fromarray(image)
         
-        # Color the title based on waveform characteristics
-        # Higher frequencies = more blue, lower = more red
-        hue = (0.6 + 0.4 * spectral_factor) % 1.0  # Hue ranges from blue-purple to red
-        saturation = 0.8 - 0.2 * energy_factor  # Less saturation on louder parts
-        lightness = 0.7 + 0.3 * energy_factor  # Brighter on louder parts
-        
-        r, g, b = [int(255 * c) for c in colorsys.hsv_to_rgb(hue, saturation, lightness)]
+        # Pure white for text and glow
+        r, g, b = 255, 255, 255  # WHITE
         
         # Create a colored version of the text
         colored_img = Image.new('RGBA', img.size)
@@ -195,9 +183,8 @@ def create_title_clip():
             # Different radius for each layer
             current_radius = glow_radius * (1 - i * 0.3)
             
-            # Apply different hue shift for each layer
-            layer_hue = (hue + i * 0.1) % 1.0
-            layer_r, layer_g, layer_b = [int(255 * c) for c in colorsys.hsv_to_rgb(layer_hue, saturation, lightness)]
+            # WHITE GLOW always
+            layer_r, layer_g, layer_b = 255, 255, 255
             
             # Create colored layer
             glow_layer = Image.new('RGBA', img.size)
@@ -276,13 +263,8 @@ def make_title_glow(t):
     # Center of the screen
     center_x, center_y = w_video // 2, h_video // 2
     
-    # Get spectral information
-    spectral_value = np.interp(t, spectral_times, spectral_centroid)
-    spectral_factor = (spectral_value - np.min(spectral_centroid)) / (np.max(spectral_centroid) - np.min(spectral_centroid))
-    
-    # Create a glow effect behind the title
-    hue = (0.6 + 0.4 * spectral_factor) % 1.0
-    r, g, b = [int(255 * c) for c in colorsys.hsv_to_rgb(hue, 0.8, 0.5 + 0.5 * energy_factor)]
+    # WHITE glow effect behind the title
+    r, g, b = 255, 255, 255  # WHITE
     
     # Calculate title dimensions (approximate)
     title_width = len(TITLE) * 55  # Rough estimate based on 90px font
@@ -296,7 +278,6 @@ def make_title_glow(t):
     for i in range(3):
         current_radius = glow_radius * (1 - i * 0.3)
         alpha = int(100 * (1 - i * 0.3) * energy_factor)
-        current_color = (r, g, b)
         
         # Draw radial gradient
         for radius in range(int(current_radius), 0, -20):
@@ -346,11 +327,11 @@ def make_title_glow(t):
                     points_above.append((x, waveform_top + y_offset))
                     points_below.append((x, waveform_bottom - y_offset))
                 
-                # Draw waveform lines
+                # Draw waveform lines in WHITE
                 if len(points_above) > 1:
-                    draw.line(points_above, fill=(r, g, b), width=2)
+                    draw.line(points_above, fill=(255, 255, 255), width=2)
                 if len(points_below) > 1:
-                    draw.line(points_below, fill=(r, g, b), width=2)
+                    draw.line(points_below, fill=(255, 255, 255), width=2)
     
     return np.array(img)
 
@@ -361,9 +342,9 @@ title_clip = create_title_clip()
 # Composite all clips
 video = CompositeVideoClip([
     background,
-    image_clip,  # Background image
-    title_glow,  # Glow and waveform effects
-    title_clip,  # Centered title with effects
+    image_clip,  # Background image with 80% opacity
+    title_glow,  # Glow and waveform effects in WHITE
+    title_clip,  # Centered title with effects in WHITE
     progress_clip  # Progress bar at bottom
 ])
 
